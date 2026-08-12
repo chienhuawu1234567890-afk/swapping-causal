@@ -1,0 +1,663 @@
+############################################################
+## Simulation Study: Multi-arm Causal Treatment-Label Swapping
+## IPW, AIPW, TMLE + Disclosure-Risk Diagnostics
+############################################################
+
+rm(list = ls())
+set.seed(2026)
+
+############################################################
+## 0. Packages
+############################################################
+
+pkgs <- c("MASS", "nnet", "dplyr", "tidyr", "purrr", "stringr")
+
+for (p in pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) {
+    install.packages(p, dependencies = TRUE)
+  }
+  library(p, character.only = TRUE)
+}
+
+############################################################
+## 1. Simulation settings
+############################################################
+
+R_mc <- 300
+B_release <- 100
+
+N_grid   <- c(500, 1000)
+p_grid   <- c(5, 10)
+rho_grid <- c(0.3, 0.6)
+g_grid   <- c(3, 5)
+
+alpha <- 0.05
+
+methods <- c(
+  "Original",
+  "Proposed_Label_Swap",
+  "Random_Swap",
+  "PRAM",
+  "Randomized_Response",
+  "Synthetic_Treatment",
+  "DP_Randomized_Response"
+)
+
+############################################################
+## 2. Helper functions
+############################################################
+
+expit <- function(x) 1 / (1 + exp(-x))
+
+softmax <- function(eta) {
+  eta <- eta - max(eta)
+  prob <- exp(eta) / sum(exp(eta))
+  prob
+}
+
+make_sigma <- function(p, rho) {
+  outer(seq_len(p), seq_len(p), function(i, j) rho^abs(i - j))
+}
+
+make_pairwise_contrasts <- function(g) {
+  combn(0:(g - 1), 2, simplify = FALSE)
+}
+
+############################################################
+## 3. Generate simulated multi-arm causal data
+############################################################
+
+generate_data <- function(N, p, rho, g) {
+  
+  Sigma <- make_sigma(p, rho)
+  X <- MASS::mvrnorm(N, mu = rep(0, p), Sigma = Sigma)
+  colnames(X) <- paste0("X", seq_len(p))
+  
+  ## True treatment effects
+  tau_true <- seq(0, by = 0.4, length.out = g)
+  
+  ## Multinomial treatment assignment model
+  Gamma <- matrix(0, nrow = g, ncol = p)
+  for (a in 2:g) {
+    Gamma[a, ] <- runif(p, -0.4, 0.4)
+  }
+  
+  eta <- X %*% t(Gamma)
+  prob_A <- t(apply(eta, 1, softmax))
+  
+  A <- apply(prob_A, 1, function(pr) sample(0:(g - 1), size = 1, prob = pr))
+  
+  ## Continuous potential outcome model
+  beta_x <- seq(0.3, 0.1, length.out = p)
+  mu0 <- as.vector(X %*% beta_x + 0.5 * X[, 1]^2 - 0.3 * X[, 2])
+  
+  Y <- mu0 + tau_true[A + 1] + rnorm(N, mean = 0, sd = 1)
+  
+  dat <- data.frame(
+    id = seq_len(N),
+    A = A,
+    Y = Y,
+    X
+  )
+  
+  attr(dat, "tau_true") <- tau_true
+  dat
+}
+
+############################################################
+## 4. Fit nuisance models
+############################################################
+
+fit_nuisance <- function(dat, g) {
+  
+  xnames <- grep("^X", names(dat), value = TRUE)
+  
+  ## Multinomial propensity score
+  form_ps <- as.formula(
+    paste("factor(A) ~", paste(xnames, collapse = " + "))
+  )
+  
+  ps_fit <- nnet::multinom(form_ps, data = dat, trace = FALSE)
+  ps_hat <- predict(ps_fit, type = "probs")
+  
+  if (g == 2) {
+    ps_hat <- cbind(1 - ps_hat, ps_hat)
+  }
+  
+  colnames(ps_hat) <- paste0("ps", 0:(g - 1))
+  ps_hat <- pmax(ps_hat, 0.01)
+  ps_hat <- ps_hat / rowSums(ps_hat)
+  
+  ## Outcome regression by treatment arm
+  Q_hat <- matrix(NA, nrow = nrow(dat), ncol = g)
+  colnames(Q_hat) <- paste0("Q", 0:(g - 1))
+  
+  for (a in 0:(g - 1)) {
+    dsub <- dat[dat$A == a, ]
+    
+    if (nrow(dsub) < 10) {
+      Q_hat[, a + 1] <- mean(dat$Y)
+    } else {
+      form_y <- as.formula(
+        paste("Y ~", paste(xnames, collapse = " + "))
+      )
+      fit_y <- lm(form_y, data = dsub)
+      Q_hat[, a + 1] <- predict(fit_y, newdata = dat)
+    }
+  }
+  
+  list(
+    ps_hat = ps_hat,
+    Q_hat = Q_hat
+  )
+}
+
+############################################################
+## 5. Simple continuous-outcome TMLE fluctuation
+############################################################
+
+tmle_update <- function(dat, ps_hat, Q_hat, g) {
+  
+  Q_star <- Q_hat
+  
+  for (a in 0:(g - 1)) {
+    H <- as.numeric(dat$A == a) / ps_hat[, a + 1]
+    offset <- Q_hat[, a + 1]
+    
+    fit_fluc <- lm(dat$Y ~ -1 + H + offset(offset))
+    eps <- coef(fit_fluc)[1]
+    
+    if (is.na(eps)) eps <- 0
+    
+    Q_star[, a + 1] <- Q_hat[, a + 1] + eps
+  }
+  
+  Q_star
+}
+
+############################################################
+## 6. Construct causal strata
+############################################################
+
+construct_strata <- function(dat, ps_hat, Q_hat, g,
+                             n_bins_y = 4,
+                             n_bins_ps = 4,
+                             n_bins_q = 4) {
+  
+  ps_obs <- ps_hat[cbind(seq_len(nrow(dat)), dat$A + 1)]
+  q_obs  <- Q_hat[cbind(seq_len(nrow(dat)), dat$A + 1)]
+  
+  y_bin <- dplyr::ntile(dat$Y, n_bins_y)
+  p_bin <- dplyr::ntile(ps_obs, n_bins_ps)
+  q_bin <- dplyr::ntile(q_obs, n_bins_q)
+  
+  strata <- paste(y_bin, p_bin, q_bin, sep = "_")
+  strata
+}
+
+############################################################
+## 7. Privacy-protection methods
+############################################################
+
+proposed_label_swap <- function(A, strata, pi_swap = 0.5) {
+  
+  A_new <- A
+  
+  for (s in unique(strata)) {
+    idx <- which(strata == s)
+    
+    if (length(idx) < 2) next
+    
+    for (k in seq_along(idx)) {
+      if (runif(1) < pi_swap) {
+        j <- sample(idx, 1)
+        tmp <- A_new[idx[k]]
+        A_new[idx[k]] <- A_new[j]
+        A_new[j] <- tmp
+      }
+    }
+  }
+  
+  A_new
+}
+
+random_swap <- function(A, pi_swap = 0.5) {
+  
+  A_new <- A
+  idx <- seq_along(A)
+  
+  for (i in idx) {
+    if (runif(1) < pi_swap) {
+      j <- sample(idx, 1)
+      tmp <- A_new[i]
+      A_new[i] <- A_new[j]
+      A_new[j] <- tmp
+    }
+  }
+  
+  A_new
+}
+
+pram_release <- function(A, g, stay_prob = 0.85) {
+  
+  A_new <- A
+  
+  for (i in seq_along(A)) {
+    probs <- rep((1 - stay_prob) / (g - 1), g)
+    probs[A[i] + 1] <- stay_prob
+    A_new[i] <- sample(0:(g - 1), 1, prob = probs)
+  }
+  
+  A_new
+}
+
+randomized_response <- function(A, g, stay_prob = 0.80) {
+  
+  A_new <- A
+  
+  for (i in seq_along(A)) {
+    if (runif(1) > stay_prob) {
+      A_new[i] <- sample(setdiff(0:(g - 1), A[i]), 1)
+    }
+  }
+  
+  A_new
+}
+
+synthetic_treatment <- function(ps_hat) {
+  
+  g <- ncol(ps_hat)
+  apply(ps_hat, 1, function(pr) sample(0:(g - 1), 1, prob = pr))
+}
+
+dp_randomized_response <- function(A, g, epsilon = 1) {
+  
+  p_true <- exp(epsilon) / (exp(epsilon) + g - 1)
+  pram_release(A, g, stay_prob = p_true)
+}
+
+apply_release_method <- function(dat, nuisance, strata, method, g) {
+  
+  A <- dat$A
+  
+  A_new <- switch(
+    method,
+    "Original" = A,
+    "Proposed_Label_Swap" = proposed_label_swap(A, strata, pi_swap = 0.5),
+    "Random_Swap" = random_swap(A, pi_swap = 0.5),
+    "PRAM" = pram_release(A, g, stay_prob = 0.85),
+    "Randomized_Response" = randomized_response(A, g, stay_prob = 0.80),
+    "Synthetic_Treatment" = synthetic_treatment(nuisance$ps_hat),
+    "DP_Randomized_Response" = dp_randomized_response(A, g, epsilon = 1)
+  )
+  
+  dat_new <- dat
+  dat_new$A <- A_new
+  dat_new
+}
+
+############################################################
+## 8. Estimate causal effects: IPW, AIPW, TMLE
+############################################################
+
+estimate_effects <- function(dat, g, true_tau = NULL) {
+  
+  nuisance <- fit_nuisance(dat, g)
+  ps_hat <- nuisance$ps_hat
+  Q_hat  <- nuisance$Q_hat
+  Q_star <- tmle_update(dat, ps_hat, Q_hat, g)
+  
+  N <- nrow(dat)
+  pairs <- make_pairwise_contrasts(g)
+  
+  out <- list()
+  
+  for (cc in pairs) {
+    
+    a <- cc[1]
+    b <- cc[2]
+    
+    Ia <- as.numeric(dat$A == a)
+    Ib <- as.numeric(dat$A == b)
+    
+    ## IPW
+    phi_a_ipw <- Ia * dat$Y / ps_hat[, a + 1]
+    phi_b_ipw <- Ib * dat$Y / ps_hat[, b + 1]
+    tau_ipw <- mean(phi_a_ipw - phi_b_ipw)
+    se_ipw <- sd(phi_a_ipw - phi_b_ipw) / sqrt(N)
+    
+    ## AIPW
+    phi_a_aipw <- Q_hat[, a + 1] + Ia / ps_hat[, a + 1] * 
+      (dat$Y - Q_hat[, a + 1])
+    phi_b_aipw <- Q_hat[, b + 1] + Ib / ps_hat[, b + 1] * 
+      (dat$Y - Q_hat[, b + 1])
+    tau_aipw <- mean(phi_a_aipw - phi_b_aipw)
+    se_aipw <- sd(phi_a_aipw - phi_b_aipw) / sqrt(N)
+    
+    ## TMLE
+    phi_a_tmle <- Q_star[, a + 1] + Ia / ps_hat[, a + 1] * 
+      (dat$Y - Q_star[, a + 1])
+    phi_b_tmle <- Q_star[, b + 1] + Ib / ps_hat[, b + 1] * 
+      (dat$Y - Q_star[, b + 1])
+    tau_tmle <- mean(Q_star[, a + 1] - Q_star[, b + 1])
+    se_tmle <- sd(phi_a_tmle - phi_b_tmle) / sqrt(N)
+    
+    est_table <- data.frame(
+      contrast = paste0(a, " vs ", b),
+      estimator = c("IPW", "AIPW", "TMLE"),
+      estimate = c(tau_ipw, tau_aipw, tau_tmle),
+      se = c(se_ipw, se_aipw, se_tmle)
+    )
+    
+    est_table$ci_lower <- est_table$estimate - qnorm(0.975) * est_table$se
+    est_table$ci_upper <- est_table$estimate + qnorm(0.975) * est_table$se
+    est_table$ci_width <- est_table$ci_upper - est_table$ci_lower
+    est_table$wald <- est_table$estimate / est_table$se
+    est_table$p_value <- 2 * pnorm(-abs(est_table$wald))
+    
+    if (!is.null(true_tau)) {
+      est_table$true_effect <- true_tau[a + 1] - true_tau[b + 1]
+    } else {
+      est_table$true_effect <- NA_real_
+    }
+    
+    out[[length(out) + 1]] <- est_table
+  }
+  
+  bind_rows(out)
+}
+
+############################################################
+## 9. Preservation measures
+############################################################
+
+compute_preservation <- function(all_estimates) {
+  
+  original <- all_estimates %>%
+    filter(method == "Original") %>%
+    select(
+      scenario_id, rep_id, contrast, estimator,
+      estimate_orig = estimate,
+      se_orig = se,
+      ci_width_orig = ci_width,
+      wald_orig = wald,
+      p_value_orig = p_value
+    )
+  
+  all_estimates %>%
+    left_join(
+      original,
+      by = c("scenario_id", "rep_id", "contrast", "estimator")
+    ) %>%
+    mutate(
+      abs_diff_estimate = abs(estimate - estimate_orig),
+      abs_diff_se = abs(se - se_orig),
+      abs_diff_ci_width = abs(ci_width - ci_width_orig),
+      abs_diff_wald = abs(wald - wald_orig),
+      abs_diff_p_value = abs(p_value - p_value_orig)
+    )
+}
+
+############################################################
+## 10. Accuracy summaries
+############################################################
+
+compute_accuracy <- function(all_estimates) {
+  
+  all_estimates %>%
+    mutate(
+      covered = ci_lower <= true_effect & ci_upper >= true_effect,
+      error = estimate - true_effect,
+      sq_error = error^2
+    ) %>%
+    group_by(N, p, rho, g, method, contrast, estimator) %>%
+    summarise(
+      bias = mean(error, na.rm = TRUE),
+      empirical_se = sd(estimate, na.rm = TRUE),
+      avg_estimated_se = mean(se, na.rm = TRUE),
+      mse = mean(sq_error, na.rm = TRUE),
+      rmse = sqrt(mse),
+      coverage = mean(covered, na.rm = TRUE),
+      avg_ci_width = mean(ci_width, na.rm = TRUE),
+      .groups = "drop"
+    )
+}
+
+############################################################
+## 11. Disclosure-risk diagnostics
+############################################################
+
+compute_disclosure <- function(A_original, release_mat, g, strata = NULL) {
+  
+  N <- length(A_original)
+  B <- ncol(release_mat)
+  
+  p_hat <- matrix(0, nrow = N, ncol = g)
+  
+  for (a in 0:(g - 1)) {
+    p_hat[, a + 1] <- rowMeans(release_mat == a)
+  }
+  
+  entropy_i <- -rowSums(ifelse(p_hat > 0, p_hat * log(p_hat), 0))
+  norm_entropy_i <- entropy_i / log(g)
+  
+  retention_i <- p_hat[cbind(seq_len(N), A_original + 1)]
+  change_i <- 1 - retention_i
+  id_i <- apply(p_hat, 1, max)
+  diversity_i <- rowSums(p_hat > 0)
+  
+  if (is.null(strata)) {
+    non_swappable_i <- rep(NA_real_, N)
+  } else {
+    tab_s <- table(strata)
+    non_swappable_i <- as.numeric(tab_s[strata] <= 1)
+  }
+  
+  data.frame(
+    entropy = mean(entropy_i),
+    normalized_entropy = mean(norm_entropy_i),
+    retention_probability = mean(retention_i),
+    treatment_change_rate = mean(change_i),
+    identification_probability = mean(id_i),
+    reachable_diversity = mean(diversity_i),
+    non_swappable_rate = mean(non_swappable_i, na.rm = TRUE)
+  )
+}
+
+repeat_release_for_disclosure <- function(dat, nuisance, strata, method, g, B) {
+  
+  release_mat <- matrix(NA, nrow = nrow(dat), ncol = B)
+  
+  for (b in seq_len(B)) {
+    released <- apply_release_method(dat, nuisance, strata, method, g)
+    release_mat[, b] <- released$A
+  }
+  
+  compute_disclosure(
+    A_original = dat$A,
+    release_mat = release_mat,
+    g = g,
+    strata = strata
+  )
+}
+
+############################################################
+## 12. Main simulation loop
+############################################################
+
+all_estimates <- list()
+all_disclosure <- list()
+
+scenario_grid <- expand.grid(
+  N = N_grid,
+  p = p_grid,
+  rho = rho_grid,
+  g = g_grid
+)
+
+scenario_grid$scenario_id <- seq_len(nrow(scenario_grid))
+
+counter_est <- 1
+counter_disc <- 1
+
+for (s in seq_len(nrow(scenario_grid))) {
+  
+  N_s   <- scenario_grid$N[s]
+  p_s   <- scenario_grid$p[s]
+  rho_s <- scenario_grid$rho[s]
+  g_s   <- scenario_grid$g[s]
+  sid   <- scenario_grid$scenario_id[s]
+  
+  cat("\nScenario", sid, 
+      ": N =", N_s, 
+      ", p =", p_s, 
+      ", rho =", rho_s, 
+      ", g =", g_s, "\n")
+  
+  for (r in seq_len(R_mc)) {
+    
+    if (r %% 25 == 0) {
+      cat("  Monte Carlo replicate:", r, "\n")
+    }
+    
+    dat <- generate_data(N = N_s, p = p_s, rho = rho_s, g = g_s)
+    true_tau <- attr(dat, "tau_true")
+    
+    nuisance_original <- fit_nuisance(dat, g_s)
+    strata <- construct_strata(
+      dat = dat,
+      ps_hat = nuisance_original$ps_hat,
+      Q_hat = nuisance_original$Q_hat,
+      g = g_s
+    )
+    
+    for (m in methods) {
+      
+      dat_release <- apply_release_method(
+        dat = dat,
+        nuisance = nuisance_original,
+        strata = strata,
+        method = m,
+        g = g_s
+      )
+      
+      est <- estimate_effects(dat_release, g = g_s, true_tau = true_tau)
+      
+      est$scenario_id <- sid
+      est$rep_id <- r
+      est$N <- N_s
+      est$p <- p_s
+      est$rho <- rho_s
+      est$g <- g_s
+      est$method <- m
+      
+      all_estimates[[counter_est]] <- est
+      counter_est <- counter_est + 1
+    }
+    
+    ## Disclosure diagnostics only once per Monte Carlo dataset
+    ## to reduce computation. Increase frequency if desired.
+    for (m in methods) {
+      
+      disc <- repeat_release_for_disclosure(
+        dat = dat,
+        nuisance = nuisance_original,
+        strata = strata,
+        method = m,
+        g = g_s,
+        B = B_release
+      )
+      
+      disc$scenario_id <- sid
+      disc$rep_id <- r
+      disc$N <- N_s
+      disc$p <- p_s
+      disc$rho <- rho_s
+      disc$g <- g_s
+      disc$method <- m
+      
+      all_disclosure[[counter_disc]] <- disc
+      counter_disc <- counter_disc + 1
+    }
+  }
+}
+
+############################################################
+## 13. Combine results
+############################################################
+
+estimate_results <- bind_rows(all_estimates)
+disclosure_results <- bind_rows(all_disclosure)
+
+preservation_results <- compute_preservation(estimate_results)
+accuracy_results <- compute_accuracy(estimate_results)
+
+disclosure_summary <- disclosure_results %>%
+  group_by(N, p, rho, g, method) %>%
+  summarise(
+    entropy = mean(entropy, na.rm = TRUE),
+    normalized_entropy = mean(normalized_entropy, na.rm = TRUE),
+    retention_probability = mean(retention_probability, na.rm = TRUE),
+    treatment_change_rate = mean(treatment_change_rate, na.rm = TRUE),
+    identification_probability = mean(identification_probability, na.rm = TRUE),
+    reachable_diversity = mean(reachable_diversity, na.rm = TRUE),
+    non_swappable_rate = mean(non_swappable_rate, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+preservation_summary <- preservation_results %>%
+  group_by(N, p, rho, g, method, contrast, estimator) %>%
+  summarise(
+    mean_abs_diff_estimate = mean(abs_diff_estimate, na.rm = TRUE),
+    mean_abs_diff_se = mean(abs_diff_se, na.rm = TRUE),
+    mean_abs_diff_ci_width = mean(abs_diff_ci_width, na.rm = TRUE),
+    mean_abs_diff_wald = mean(abs_diff_wald, na.rm = TRUE),
+    mean_abs_diff_p_value = mean(abs_diff_p_value, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+############################################################
+## 14. Save results
+############################################################
+
+out_dir <- file.path(getwd(), "simulation_results")
+if (!dir.exists(out_dir)) dir.create(out_dir)
+
+write.csv(
+  estimate_results,
+  file.path(out_dir, "estimate_results.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  preservation_results,
+  file.path(out_dir, "preservation_results.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  preservation_summary,
+  file.path(out_dir, "preservation_summary.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  accuracy_results,
+  file.path(out_dir, "accuracy_summary.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  disclosure_results,
+  file.path(out_dir, "disclosure_results.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  disclosure_summary,
+  file.path(out_dir, "disclosure_summary.csv"),
+  row.names = FALSE
+)
+
+cat("\nSimulation completed successfully.\n")
+cat("Results saved in:", out_dir, "\n")
